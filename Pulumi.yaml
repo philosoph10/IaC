@@ -1,0 +1,9 @@
+name: IaC
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: .venv
+description: HW2
+config:
+  aws:region: eu-north-1
