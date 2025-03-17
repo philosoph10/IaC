@@ -1,0 +1,338 @@
+# - name: Add PostgreSQL official repository
+#   ansible.builtin.apt_repository:
+#     repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+#     state: present
+#     filename: "pgdg"
+
+# - name: Import PostgreSQL signing key
+#   ansible.builtin.apt_key:
+#     url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+#     state: present
+
+# - name: Update package lists
+#   ansible.builtin.apt:
+#     update_cache: yes
+
+- name: Install ACL package (fix permission issues)
+  ansible.builtin.apt:
+    name: acl
+    state: present
+    update_cache: yes
+
+- name: Install PostgreSQL
+  apt:
+    name: "postgresql"
+    state: present
+    update_cache: yes
+
+# not sure
+- name: Check if PostgreSQL data directory exists
+  ansible.builtin.stat:
+    path: /var/lib/postgresql/12/main
+  register: pg_data_dir
+
+- name: Drop broken PostgreSQL cluster if data directory is missing
+  command: pg_dropcluster 12 main --stop
+  become: true
+  when: "'replica' in group_names and not pg_data_dir.stat.exists"
+
+- name: Recreate PostgreSQL cluster if missing
+  command: pg_createcluster 12 main --start
+  become: true
+  when: "'replica' in group_names and not pg_data_dir.stat.exists"
+
+- name: Ensure PostgreSQL service is running
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: yes
+  become: true
+# not sure
+
+- name: Ensure PostgreSQL service is running
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: yes
+
+- name: Install required PostgreSQL dependencies
+  ansible.builtin.apt:
+    name:
+      - python3-psycopg2
+      - libpq-dev
+    state: present
+    update_cache: yes
+
+- name: Create replication user
+  community.postgresql.postgresql_user:
+    name: replica_user
+    password: "replica_pass"  # Ensure password is set
+    role_attr_flags: REPLICATION
+    state: present
+  become: true
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Get PostgreSQL data directory
+  shell: "psql -t -c 'SHOW data_directory;'"
+  become_user: postgres
+  register: pg_data_dir
+  changed_when: false
+
+- name: Allow replication in PostgreSQL config
+  community.postgresql.postgresql_set:
+    name: wal_level
+    value: logical
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Setup pg_hba.conf for replication
+  community.postgresql.postgresql_pg_hba:
+    dest: "/etc/postgresql/12/main/pg_hba.conf"
+    contype: host
+    users: replica_user
+    source: "{{ hostvars['server2']['ansible_host'] }}/32"
+    databases: replication
+    method: md5
+  become: true
+  become_user: postgres
+  notify: Restart PostgreSQL
+  when: "'primary' in group_names"
+
+- name: Allow replica_user to connect to all databases with a password
+  community.postgresql.postgresql_pg_hba:
+    dest: "/etc/postgresql/12/main/pg_hba.conf"
+    contype: host
+    users: replica_user
+    source: "{{ hostvars['server2']['private_ip'] }}/32"
+    databases: all
+    method: md5
+  become: true
+  become_user: postgres
+  notify: Restart PostgreSQL
+  when: "'primary' in group_names"
+
+# Streaming replication
+- name: Ensure PostgreSQL listens on all network interfaces
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql/12/main/postgresql.conf
+    regexp: '^listen_addresses'
+    line: "listen_addresses = '*'"
+  become: true
+  notify: Restart PostgreSQL
+  when: "'primary' in group_names"
+
+- name: Allow replication in pg_hba.conf
+  community.postgresql.postgresql_pg_hba:
+    dest: "/etc/postgresql/12/main/pg_hba.conf"
+    contype: host
+    users: replica_user
+    source: "{{ hostvars['server2']['private_ip'] }}/32"
+    databases: replication
+    method: md5
+  become: true
+  become_user: postgres
+  notify: Restart PostgreSQL
+  when: "'primary' in group_names"
+
+- name: Ensure archaeology_db exists
+  community.postgresql.postgresql_db:
+    name: archaeology_db
+    state: present
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Grant SELECT permissions to replica_user on all existing tables
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: "GRANT SELECT ON ALL TABLES IN SCHEMA public TO replica_user;"
+  become: true
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Grant SELECT on future tables automatically
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replica_user;"
+  become: true
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Restart PostgreSQL
+  ansible.builtin.service:
+    name: postgresql
+    state: restarted
+  become: true
+
+# ----------------
+- name: Stop PostgreSQL on Replica Before Replication
+  ansible.builtin.service:
+    name: postgresql
+    state: stopped
+  become: true
+  when: "'replica' in group_names"
+
+- name: Remove Existing PostgreSQL Data Directory on Replica
+  ansible.builtin.file:
+    path: "/var/lib/postgresql/12/main"
+    state: absent
+  become: true
+  when: "'replica' in group_names"
+
+- name: Create streaming replication on Replica
+  command: > 
+    pg_basebackup -h {{ hostvars['server1']['private_ip'] }} 
+    -D /var/lib/postgresql/12/main 
+    -U replica_user 
+    -Fp -Xs -P -R
+  environment:
+    PGPASSWORD: "replica_pass"
+  become_user: postgres
+  when: "'replica' in group_names"
+
+- name: Ensure Replica PostgreSQL is in standby mode
+  ansible.builtin.lineinfile:
+    path: /var/lib/postgresql/12/main/postgresql.auto.conf
+    line: "primary_conninfo = 'host={{ hostvars['server1']['private_ip'] }} user=replica_user password=replica_pass'"
+  become_user: postgres
+  notify: Restart PostgreSQL
+  when: "'replica' in group_names"
+
+# ----------------
+
+# Create database and insert data for testing
+
+- name: Create tables in archaeology_db
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: |
+      CREATE TABLE IF NOT EXISTS sites (
+          site_id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          location VARCHAR(255),
+          discovered_year INT
+      );
+
+      CREATE TABLE IF NOT EXISTS artifacts (
+          artifact_id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          description TEXT,
+          material VARCHAR(100),
+          estimated_age INT,
+          site_id INT REFERENCES sites(site_id) ON DELETE SET NULL
+      );
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Insert sample data into sites
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: |
+      INSERT INTO sites (name, location, discovered_year) VALUES
+      ('Pompeii Ruins', 'Italy', 1748),
+      ('Machu Picchu', 'Peru', 1911),
+      ('Göbekli Tepe', 'Turkey', 1994)
+      ON CONFLICT DO NOTHING;
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Insert sample data into artifacts
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: |
+      INSERT INTO artifacts (name, description, material, estimated_age, site_id) VALUES
+      ('Roman Coin', 'Ancient Roman coin with engravings', 'Gold', 2000, 1),
+      ('Inca Pottery', 'Ceramic pot with geometric carvings', 'Clay', 500, 2),
+      ('Carved Stone Pillar', 'Massive carved limestone pillar', 'Limestone', 12000, 3)
+      ON CONFLICT DO NOTHING;
+  become_user: postgres
+  when: "'primary' in group_names"
+
+# Set up logical replication
+
+- name: Check if the logical replication cluster exists
+  command: pg_lsclusters
+  register: pg_clusters
+  changed_when: false
+
+- name: Create a second PostgreSQL cluster for logical replication if not exists
+  command: pg_createcluster 12 logical_replication --start
+  become: true
+  when: "'logical_replication' not in pg_clusters.stdout"
+# - name: Create a second PostgreSQL cluster for logical replication
+#   command: pg_createcluster 12 logical_replication --start
+#   become: true
+#   when: "'replica' in group_names"
+
+- name: Ensure logical replication cluster is running
+  ansible.builtin.service:
+    name: postgresql@12-logical_replication
+    state: started
+  become: true
+  when: "'replica' in group_names"
+
+- name: Create publication for logical replication (if not exists)
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'my_pub') THEN CREATE PUBLICATION my_pub FOR TABLE artifacts; END IF; END $$;"
+  become: true
+  become_user: postgres
+  when: "'primary' in group_names"
+
+- name: Ensure PostgreSQL logical replication cluster listens on all network interfaces (Replica)
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql/12/logical_replication/postgresql.conf
+    regexp: '^listen_addresses'
+    line: "listen_addresses = '*'"
+  become: true
+  notify: Restart Logical Replication Cluster
+  when: "'replica' in group_names"
+
+- name: Ensure archaeology_db exists on Replica in logical replication cluster
+  community.postgresql.postgresql_db:
+    name: archaeology_db
+    state: present
+  become: true
+  become_user: postgres
+  when: "'replica' in group_names"
+  environment:
+    PGCLUSTER: "12/logical_replication"
+    PGPORT: "5433"
+
+- name: Ensure artifacts table exists in logical replication cluster
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    # login_host: "{{ hostvars['server2']['ansible_host'] }}/32"
+    # login_user: postgres
+    query: |
+      CREATE TABLE IF NOT EXISTS artifacts (
+          artifact_id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          description TEXT,
+          material VARCHAR(100),
+          estimated_age INT,
+          site_id INT
+      );
+  become: true
+  become_user: postgres
+  when: "'replica' in group_names"
+  environment:
+    PGCLUSTER: "12/logical_replication"
+    PGPORT: "5433"
+
+- name: Create subscription in the logical replication cluster
+  community.postgresql.postgresql_query:
+    db: archaeology_db
+    query: |
+      CREATE SUBSCRIPTION my_sub 
+      CONNECTION 'host={{ hostvars['server1']['private_ip'] }} port=5432 user=replica_user password=replica_pass dbname=archaeology_db'
+      PUBLICATION my_pub
+      WITH (create_slot = true)
+    autocommit: true
+  become: true
+  become_user: postgres
+  when: "'replica' in group_names"
+  environment:
+    PGCLUSTER: "12/logical_replication"
+    PGPORT: "5433"
+  # ignore_errors: true

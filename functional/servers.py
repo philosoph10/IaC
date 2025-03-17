@@ -5,6 +5,7 @@ from utils.variables import ami_id, instance_type, my_ssh_key, other_ssh_key
 
 def create_server(name: str):
     user_data = f"""#!/bin/bash
+    apt update && apt install -y python3 python3-pip
     echo '{my_ssh_key}' >> /home/ubuntu/.ssh/authorized_keys
     echo '{other_ssh_key}' >> /home/ubuntu/.ssh/authorized_keys
     chmod 600 /home/ubuntu/.ssh/authorized_keys

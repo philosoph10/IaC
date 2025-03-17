@@ -1,0 +1,17 @@
+all:
+  children:
+    primary:
+      hosts:
+        server1: {}
+    replica:
+      hosts:
+        server2: {}
+  hosts:
+    server1:
+      ansible_host: 51.20.114.159
+      ansible_user: ubuntu
+      private_ip: 172.31.20.209
+    server2:
+      ansible_host: 16.16.63.50
+      ansible_user: ubuntu
+      private_ip: 172.31.19.224

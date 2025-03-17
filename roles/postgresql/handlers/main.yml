@@ -1,0 +1,11 @@
+- name: Restart PostgreSQL
+  ansible.builtin.service:
+    name: postgresql
+    state: restarted
+  become: true
+
+- name: Restart Logical Replication Cluster
+  ansible.builtin.service:
+    name: postgresql@12-logical_replication 
+    state: restarted
+  become: true
