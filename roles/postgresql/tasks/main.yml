@@ -1,18 +1,3 @@
-# - name: Add PostgreSQL official repository
-#   ansible.builtin.apt_repository:
-#     repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
-#     state: present
-#     filename: "pgdg"
-
-# - name: Import PostgreSQL signing key
-#   ansible.builtin.apt_key:
-#     url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
-#     state: present
-
-# - name: Update package lists
-#   ansible.builtin.apt:
-#     update_cache: yes
-
 - name: Install ACL package (fix permission issues)
   ansible.builtin.apt:
     name: acl
@@ -25,7 +10,6 @@
     state: present
     update_cache: yes
 
-# not sure
 - name: Check if PostgreSQL data directory exists
   ansible.builtin.stat:
     path: /var/lib/postgresql/12/main
@@ -47,7 +31,6 @@
     state: started
     enabled: yes
   become: true
-# not sure
 
 - name: Ensure PostgreSQL service is running
   ansible.builtin.service:
@@ -66,7 +49,7 @@
 - name: Create replication user
   community.postgresql.postgresql_user:
     name: replica_user
-    password: "replica_pass"  # Ensure password is set
+    password: "replica_pass"
     role_attr_flags: REPLICATION
     state: present
   become: true
@@ -164,7 +147,6 @@
     state: restarted
   become: true
 
-# ----------------
 - name: Stop PostgreSQL on Replica Before Replication
   ansible.builtin.service:
     name: postgresql
@@ -197,8 +179,6 @@
   become_user: postgres
   notify: Restart PostgreSQL
   when: "'replica' in group_names"
-
-# ----------------
 
 # Create database and insert data for testing
 
@@ -259,10 +239,6 @@
   command: pg_createcluster 12 logical_replication --start
   become: true
   when: "'logical_replication' not in pg_clusters.stdout"
-# - name: Create a second PostgreSQL cluster for logical replication
-#   command: pg_createcluster 12 logical_replication --start
-#   become: true
-#   when: "'replica' in group_names"
 
 - name: Ensure logical replication cluster is running
   ansible.builtin.service:
@@ -302,8 +278,6 @@
 - name: Ensure artifacts table exists in logical replication cluster
   community.postgresql.postgresql_query:
     db: archaeology_db
-    # login_host: "{{ hostvars['server2']['ansible_host'] }}/32"
-    # login_user: postgres
     query: |
       CREATE TABLE IF NOT EXISTS artifacts (
           artifact_id SERIAL PRIMARY KEY,
@@ -335,4 +309,3 @@
   environment:
     PGCLUSTER: "12/logical_replication"
     PGPORT: "5433"
-  # ignore_errors: true
